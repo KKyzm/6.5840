@@ -8,16 +8,29 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"log"
+	"math/rand"
+	"os"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
+
+func TestLogFileConfig3A(t *testing.T) {
+	f, err := os.OpenFile("raft.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	log.SetOutput(f)
+	log.SetFlags(log.Ltime | log.Lmicroseconds | log.Lshortfile)
+}
 
 func TestInitialElection3A(t *testing.T) {
 	servers := 3
@@ -943,7 +956,6 @@ func TestFigure8Unreliable3C(t *testing.T) {
 }
 
 func internalChurn(t *testing.T, unreliable bool) {
-
 	servers := 5
 	cfg := make_config(t, servers, unreliable, false)
 	defer cfg.cleanup()
