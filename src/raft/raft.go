@@ -121,9 +121,16 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (3A).
+	currentTerm, currentState := rf.raftState()
+	return currentTerm, currentState == leaderState
+}
+
+func (rf *Raft) raftState() (int, serverState) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.currentTerm, rf.state == leaderState
+	term := rf.currentTerm
+	state := rf.state
+	return term, state
 }
 
 // save Raft's persistent state to stable storage,
@@ -391,9 +398,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	index := len(rf.log)
+	term, isLeader := rf.GetState()
+	if !isLeader {
+		return index, term, isLeader
+	}
 
 	// Your code here (3B).
 
@@ -454,16 +463,12 @@ func (rf *Raft) startElection() {
 	// send vote requests
 	args := rf.initRequestVoteArgs()
 	ch := make(chan RequestVoteReply)
-	for i := 0; i < len(rf.peers); i++ {
+	for i := range rf.peers {
 		go func(serverId int) {
 			reply := RequestVoteReply{0, false}
 			// endless retry until RPC return successfully or server state change
 			for {
-				rf.mu.Lock()
-				currentTerm := rf.currentTerm
-				currentState := rf.state
-				rf.mu.Unlock()
-
+				currentTerm, currentState := rf.raftState()
 				if currentTerm != args.Term || currentState != candidateState {
 					ch <- reply
 					return
@@ -480,23 +485,23 @@ func (rf *Raft) startElection() {
 
 	// count votes
 	voteCount := 0
-	for {
+	for range rf.peers {
 		reply := <-ch
 
 		rf.mu.Lock()
 		if reply.Term > rf.currentTerm {
+			Log(rf.me, "Received vote reply with higher term. Become Follower!")
 			rf.currentTerm = reply.Term
 			rf.state = followerState
 			rf.timer = electionTimeout()
-			rf.mu.Unlock()
-			return
+			voteCount = -len(rf.peers) // will not become leader for these term
 		}
 		rf.mu.Unlock()
 
 		if reply.Granted {
 			voteCount += 1
-			if voteCount > len(rf.peers)/2 {
-				Log(rf.me, "Received vote from majority. Become Leader!")
+			if voteCount == (len(rf.peers)/2)+1 {
+				Log(rf.me, "Received granted votes from majority. Become Leader!")
 				// win election!
 				rf.mu.Lock()
 				rf.state = leaderState
@@ -509,8 +514,7 @@ func (rf *Raft) startElection() {
 				}
 				rf.mu.Unlock()
 
-				rf.sendHeartbeats()
-				return
+				go rf.sendHeartbeats()
 			}
 		}
 	}
@@ -519,7 +523,6 @@ func (rf *Raft) startElection() {
 func (rf *Raft) sendHeartbeats() {
 	Log(rf.me, "Sending heartbeats to all servers.")
 	args := rf.initAppendEntriesArgs()
-	reply := AppendEntriesReply{}
 
 	if args.PrevLogIndex >= 0 {
 		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
@@ -528,6 +531,7 @@ func (rf *Raft) sendHeartbeats() {
 	}
 	args.LeaderCommit = rf.commitIndex
 	for i := range rf.peers {
+		reply := AppendEntriesReply{}
 		go rf.sendAppendEntries(i, args, &reply)
 	}
 }
