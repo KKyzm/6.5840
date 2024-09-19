@@ -24,12 +24,12 @@ import (
 const RaftElectionTimeout = 1000 * time.Millisecond
 
 func TestLogFileConfig3A(t *testing.T) {
-	f, err := os.OpenFile("raft.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	f, err := os.OpenFile("3A.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
 		log.Fatalf("error opening file: %v", err)
 	}
 	log.SetOutput(f)
-	log.SetFlags(log.Ltime | log.Lmicroseconds | log.Lshortfile)
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
 }
 
 func TestInitialElection3A(t *testing.T) {
@@ -38,6 +38,7 @@ func TestInitialElection3A(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (3A): initial election")
+	log.Println("Test (3A): initial election")
 
 	// is a leader elected?
 	cfg.checkOneLeader()
@@ -69,21 +70,25 @@ func TestReElection3A(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (3A): election after network failure")
+	log.Println("Test (3A): election after network failure")
 
 	leader1 := cfg.checkOneLeader()
 
 	// if the leader disconnects, a new one should be elected.
+	log.Println("====================== Disconnect leader.")
 	cfg.disconnect(leader1)
 	cfg.checkOneLeader()
 
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
+	log.Println("====================== Reconnect original leader.")
 	cfg.connect(leader1)
 	leader2 := cfg.checkOneLeader()
 
 	// if there's no quorum, no new leader should
 	// be elected.
+	log.Println("====================== Balabala.")
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
@@ -93,10 +98,12 @@ func TestReElection3A(t *testing.T) {
 	cfg.checkNoLeader()
 
 	// if a quorum arises, it should elect a leader.
+	log.Println("====================== Reconnect a server.")
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
 
 	// re-join of last node shouldn't prevent leader from existing.
+	log.Println("====================== Reconnect another server.")
 	cfg.connect(leader2)
 	cfg.checkOneLeader()
 
@@ -109,6 +116,7 @@ func TestManyElections3A(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (3A): multiple elections")
+	log.Println("Test (3A): multiple elections")
 
 	cfg.checkOneLeader()
 
@@ -134,6 +142,15 @@ func TestManyElections3A(t *testing.T) {
 	cfg.checkOneLeader()
 
 	cfg.end()
+}
+
+func TestLogFileConfig3B(t *testing.T) {
+	f, err := os.OpenFile("3B.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	log.SetOutput(f)
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
 }
 
 func TestBasicAgree3B(t *testing.T) {
