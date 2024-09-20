@@ -149,7 +149,8 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 		}
 	}
 	_, prevok := cfg.logs[i][m.CommandIndex-1]
-	cfg.logs[i][m.CommandIndex] = v
+  // log.Printf("CHECKLOGS: Check applyMsg from peer-%v, which index = %v, command = %v.", i, m.CommandIndex, m.Command.(int))
+  cfg.logs[i][m.CommandIndex] = v
 	if m.CommandIndex > cfg.maxIndex {
 		cfg.maxIndex = m.CommandIndex
 	}
@@ -163,6 +164,7 @@ func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 		if m.CommandValid == false {
 			// ignore other types of ApplyMsg
 		} else {
+      // log.Printf("APPLIER: Receive an applyMsg from peer-%v, which index = %v, command = %v.", i, m.CommandIndex, m.Command.(int))
 			cfg.mu.Lock()
 			err_msg, prevok := cfg.checkLogs(i, m)
 			cfg.mu.Unlock()
@@ -537,6 +539,7 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 		cfg.t.Fatalf("only %d decided for index %d; wanted %d",
 			nd, index, n)
 	}
+  // log.Printf("At least %v peers applied log at index %v with command = %v", n, index, cmd.(int))
 	return cmd
 }
 

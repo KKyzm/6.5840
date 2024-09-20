@@ -20,10 +20,12 @@ package raft
 import (
 	//	"bytes"
 
+	"fmt"
 	"log"
 	"math/rand"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -317,15 +319,22 @@ func (rf *Raft) initAppendEntriesArgs(i int) *AppendEntriesArgs {
 		args.Entries = append(args.Entries, rf.log[rf.nextIndex[i]])
 	}
 	args.LeaderCommit = rf.commitIndex
+	Log(rf.me, fmt.Sprintf("Form AppendEntriesArgs for peer-%v with Term = %v, PrevLogIndex = %v, PrevLogTerm = %v, leaderCommit = %v", i, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit))
 	return &args
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	Log(rf.me, "@@@ ENTER rf.AppendEntries() method @@@")
+	defer Log(rf.me, "@@@ LEAVE rf.AppendEntries() method @@@")
+
 	if rf.me == args.LeaderId {
-		log.Panic("This won't happen.")
+		log.Panic("Leader won't send AppendEntry to itself.")
+	}
+	if args.PrevLogIndex < -1 {
+		log.Panic("PrevLogIndex field in AppendEntriesArgs is at least -1.")
 	}
 
-	Log(rf.me, "Receive AppendEntry request from "+strconv.Itoa(args.LeaderId)+" with term = "+strconv.Itoa(args.Term))
+	Log(rf.me, "Receive AppendEntry request from "+strconv.Itoa(args.LeaderId)+" with term = "+strconv.Itoa(args.Term)+", prev log index = "+strconv.Itoa(args.PrevLogIndex)+".")
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
@@ -347,14 +356,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
 	if len(rf.log)-1 < args.PrevLogIndex {
+		Log(rf.me, "Current log doesn’t contain an entry at prevLogIndex.")
+		return
+	}
+	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		Log(rf.me, "Current log entry' term in prevLogIndex doesn't matches prevLogTerm.")
 		return
 	}
 	// If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
-	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		rf.log = rf.log[:args.PrevLogIndex]
-	}
+	rf.log = rf.log[:args.PrevLogIndex+1]
 	// Append any new entries not already in the log
 	for _, entry := range args.Entries {
 		rf.log = append(rf.log, entry)
@@ -363,7 +375,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// min(leaderCommit, index of last new entry)
 	if rf.commitIndex < args.LeaderCommit {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-		rf.applyCommittedLog()
+		go func() {
+			rf.applyNotifyCh <- 0
+		}()
 	}
 
 	// update server state
@@ -400,30 +414,49 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
-	index := len(rf.log)
-	term, isLeader := rf.GetState()
-	// state check
-	if !isLeader {
-		return index, term, false
-	}
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	index := len(rf.log) + 1 // from client's view, log index starts from 1, not 0
+	// state check
+	if rf.state != leaderState {
+		return index, rf.currentTerm, false
+	}
 
 	// insert entry into leader's log record
 	entry := LogEntry{command, rf.currentTerm}
 	rf.log = append(rf.log, entry)
+	rf.matchIndex[rf.me] = len(rf.log) - 1
+	Log(rf.me, "New log entry arrived.")
+	// Log(rf.me, "New log entry arrived, current log overview: "+rf.logOverview())
 	// notify leader duty goroutine to handle log replication task
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 		go func(i int) {
-			rf.requestGotCh[i] <- len(rf.log)
+			rf.requestGotCh[i] <- len(rf.log) - 1
 		}(i)
 	}
 
-	return index, term, isLeader
+	return index, rf.currentTerm, true
+}
+
+// for debug
+func (rf *Raft) logRangeOverview(start int, end int) string {
+	res := "["
+	for i := start; i < end; i++ {
+		entry := rf.log[i]
+		res += strconv.Itoa(entry.Term) + " "
+	}
+	res = strings.TrimSpace(res)
+	res += "]"
+	return res
+}
+
+// for debug
+func (rf *Raft) logOverview() string {
+	return rf.logRangeOverview(0, len(rf.log))
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -522,7 +555,7 @@ func (rf *Raft) startElection() {
 
 		res := rf.checkReceivedTerm(reply.Term)
 		if res > 0 {
-			voteCount = -len(rf.peers) // will not become leader for these term
+			voteCount = -len(rf.peers) // will not become leader for this term
 		}
 
 		if reply.Granted {
@@ -539,6 +572,7 @@ func (rf *Raft) startElection() {
 					rf.nextIndex = append(rf.nextIndex, len(rf.log))
 					rf.matchIndex = append(rf.matchIndex, -1)
 				}
+				rf.matchIndex[rf.me] = len(rf.log) - 1
 				// notify leader duty goroutines to work
 				for i := range rf.peers {
 					if i == rf.me {
@@ -586,17 +620,21 @@ func (rf *Raft) leaderDuty(i int) {
 			if !isLeader {
 				break
 			}
+			// non-block channel operation to check if new log record is arrived
+			select {
+			case lastLogIndex = <-rf.requestGotCh[i]:
+				Log(rf.me, "New log record needed to send to peer-"+strconv.Itoa(i)+".")
+			default:
+				// No new record
+			}
 			ch := make(chan bool)
-
 			go rf.sendAppendEntryWithTimeout(i, lastLogIndex, ch)
 
 			select {
-			case <-time.After(time.Duration(heartbeatTimeout()+delayTolerance) * time.Millisecond):
+			case <-time.After(time.Duration(heartbeatTimeout()) * time.Millisecond):
 				Log(rf.me, "Heartbeat timeout on peer-"+strconv.Itoa(i)+".")
-			case lastLogIndex = <-rf.requestGotCh[i]:
-				Log(rf.me, "New log record needed to send to peer-"+strconv.Itoa(i)+".")
 			case success := <-ch:
-				Log(rf.me, "AppendEntry reply received from peer-"+strconv.Itoa(i)+" with success = "+strconv.FormatBool(success)+", replicate more entries.")
+				Log(rf.me, "AppendEntry reply received from peer-"+strconv.Itoa(i)+" with success = "+strconv.FormatBool(success)+", replicate more logs.")
 			}
 		}
 		Log(rf.me, "Stop to fulfill leader duty to peer-"+strconv.Itoa(i)+".")
@@ -612,7 +650,7 @@ func (rf *Raft) sendAppendEntryWithTimeout(i int, lastLogIndex int, ch chan bool
 	go rf.sendAppendEntries(i, args, reply, requestFinishedCh)
 	var ok bool
 	select {
-	case <-time.After(time.Duration(heartbeatTimeout()) * time.Millisecond):
+	case <-time.After(time.Duration(heartbeatTimeout()-delayTolerance) * time.Millisecond):
 		return
 	case ok = <-requestFinishedCh:
 	}
@@ -631,13 +669,12 @@ func (rf *Raft) sendAppendEntryWithTimeout(i int, lastLogIndex int, ch chan bool
 		ch <- false
 		return
 	}
-	rf.logReplicated(i, args.PrevLogIndex)
+	rf.logReplicated(i, args.PrevLogIndex+len(args.Entries))
 	if args.PrevLogIndex < lastLogIndex {
 		rf.mu.Lock()
 		rf.nextIndex[i] += 1
 		rf.mu.Unlock()
 		ch <- true
-		return
 	}
 }
 
@@ -651,6 +688,7 @@ func (rf *Raft) logReplicated(serverId int, logIndex int) {
 		return
 	}
 
+	Log(rf.me, "Log that index = "+strconv.Itoa(logIndex)+" has been replicated on peer-"+strconv.Itoa(serverId)+".")
 	rf.matchIndex[serverId] = logIndex
 
 	var matches []int
@@ -661,27 +699,35 @@ func (rf *Raft) logReplicated(serverId int, logIndex int) {
 		return
 	}
 	rf.commitIndex = committedLogIndex
+	Log(rf.me, "Update commitIndex = "+strconv.Itoa(rf.commitIndex)+".")
 
 	go func() {
+		// Log(rf.me, "=== Begin === notify to apply committed log.")
 		rf.applyNotifyCh <- 0
+		// Log(rf.me, "==== End ==== notify to apply committed log.")
 	}()
 }
 
 func (rf *Raft) applyCommittedLog() {
 	for !rf.killed() {
 		<-rf.applyNotifyCh
+		Log(rf.me, "Apply notification receive.")
 		rf.mu.Lock()
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		lastApplied := rf.lastApplied
+		commitIndex := rf.commitIndex
+		rf.lastApplied = rf.commitIndex
+		Log(rf.me, fmt.Sprintf("Applying committed log from index %v to %v.", lastApplied+1, commitIndex))
+		rf.mu.Unlock()
+
+		for i := lastApplied + 1; i <= commitIndex; i++ {
 			applyMsg := ApplyMsg{}
 			applyMsg.CommandValid = true
 			applyMsg.Command = rf.log[i].Command
-			applyMsg.CommandIndex = i
-			go func() {
-				rf.applyCh <- applyMsg
-			}()
+			applyMsg.CommandIndex = i + 1
+			// Log(rf.me, "=== Begin === apply committed log of index "+strconv.Itoa(i)+".")
+			rf.applyCh <- applyMsg
+			// Log(rf.me, "==== End ==== apply committed log of index "+strconv.Itoa(i)+".")
 		}
-		rf.lastApplied = rf.commitIndex
-		rf.mu.Unlock()
 	}
 }
 
@@ -712,25 +758,26 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.timer = electionTimeout()
 	rf.leaderId = -1
 	rf.applyCh = applyCh
+	rf.applyNotifyCh = make(chan int)
 	rf.state = followerState
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.commitIndex = -1
+	rf.lastApplied = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	Log(me, "New server created!")
 
+	go rf.applyCommittedLog() // background goroutine to apply committed log when notified
+	go rf.electionTicker()    // ticker goroutine to start elections
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 		go rf.leaderDuty(i)
 	}
-	go rf.electionTicker()    // ticker goroutine to start elections
-	go rf.applyCommittedLog() // background goroutine to apply committed log when notified
 
 	return rf
 }

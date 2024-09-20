@@ -340,6 +340,7 @@ func TestFailNoAgree3B(t *testing.T) {
 	cfg.one(10, servers, false)
 
 	// 3 of 5 followers disconnect
+	log.Println("Disconnecting 3 for 5 followers...")
 	leader := cfg.checkOneLeader()
 	cfg.disconnect((leader + 1) % servers)
 	cfg.disconnect((leader + 2) % servers)
@@ -361,6 +362,7 @@ func TestFailNoAgree3B(t *testing.T) {
 	}
 
 	// repair
+	log.Println("Reconnecting 3 for 5 followers...")
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
