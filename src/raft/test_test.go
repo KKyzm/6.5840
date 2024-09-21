@@ -704,6 +704,15 @@ loop:
 	cfg.end()
 }
 
+func TestLogFileConfig3C(t *testing.T) {
+	f, err := os.OpenFile("3C.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	log.SetOutput(f)
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+}
+
 func TestPersist13C(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
