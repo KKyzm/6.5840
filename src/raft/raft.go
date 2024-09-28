@@ -328,7 +328,7 @@ type AppendEntriesReply struct {
 	ConflictIndex int
 }
 
-func (rf *Raft) initAppendEntriesArgs(i int) *AppendEntriesArgs {
+func (rf *Raft) initAppendEntriesArgs(i int, lastLogIndex int) *AppendEntriesArgs {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -340,12 +340,13 @@ func (rf *Raft) initAppendEntriesArgs(i int) *AppendEntriesArgs {
 	args.Term = rf.currentTerm
 	args.LeaderId = rf.me
 	args.PrevLogIndex = rf.nextIndex[i] - 1
+	assert(args.PrevLogIndex <= lastLogIndex, fmt.Sprintf("In peer #%v: PrevLogIndex = %v shouldn't be larger than lastLogIndex = %v.", rf.me, args.PrevLogIndex, lastLogIndex))
 	if args.PrevLogIndex >= 0 {
 		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 	} else {
 		args.PrevLogTerm = 0
 	}
-	if rf.nextIndex[i] >= 0 && rf.nextIndex[i] < len(rf.log) {
+	if rf.nextIndex[i] >= 0 && rf.nextIndex[i] <= lastLogIndex {
 		args.Entries = append(args.Entries, rf.log[rf.nextIndex[i]])
 	}
 	args.LeaderCommit = rf.commitIndex
@@ -423,13 +424,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	Log(rf.me, "AppendEntry request return succseefully.")
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply, ch chan bool) {
-	startTime := time.Now()
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	elapsed := time.Since(startTime)
-	if elapsed.Milliseconds() < heartbeatTimeout()-delayTolerance {
-		ch <- ok
-	}
+	return ok
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -466,7 +463,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 	rf.matchIndex[rf.me] = len(rf.log) - 1
 	Log(rf.me, "New log entry arrived, current log overview: "+rf.logOverview())
-	// notify leader duty goroutine to handle log replication task
+	// notify leaderduty goroutine to send AE request if possible
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -672,54 +669,63 @@ func (rf *Raft) leaderDuty(i int) {
 
 		Log(rf.me, "Begin to fulfill leader duty to peer-"+strconv.Itoa(i)+".")
 		for !rf.killed() {
-			args := rf.initAppendEntriesArgs(i)
+			args := rf.initAppendEntriesArgs(i, lastLogIndex)
 			// check state
 			if args == nil {
 				Log(rf.me, "AppendEntriesArgs is nil, stop leader duty.")
 				break
 			}
-			// non-block channel operation to check if new log record is arrived
-			select {
-			case lastLogIndex = <-rf.requestGotCh[i]:
-				Log(rf.me, "New log record needed to send to peer-"+strconv.Itoa(i)+".")
-			default:
-				// No new record
-			}
-			ch := make(chan bool)
-			go rf.sendAppendEntryWithTimeout(i, args, lastLogIndex, ch)
 
+			immeCh := make(chan bool)
+			doneCh := make(chan bool)
+			go rf.sendAppendEntryWithTimeout(i, args, lastLogIndex, immeCh, doneCh)
+
+			timeoutCh := time.After(time.Duration(heartbeatTimeout()) * time.Millisecond)
 			select {
-			case <-time.After(time.Duration(heartbeatTimeout()) * time.Millisecond):
+			case <-timeoutCh:
+				close(doneCh)
 				Log(rf.me, "Heartbeat timeout on peer-"+strconv.Itoa(i)+".")
-			case success := <-ch:
-				Log(rf.me, "AppendEntry reply received from peer-"+strconv.Itoa(i)+" with success = "+strconv.FormatBool(success)+", replicate more logs.")
+			case imme := <-immeCh:
+				if imme {
+					Log(rf.me, "More logs need to be replicated.")
+				} else {
+					select {
+					case <-timeoutCh:
+						Log(rf.me, "Heartbeat timeout on peer-"+strconv.Itoa(i)+".")
+					case lastLogIndex = <-rf.requestGotCh[i]:
+						Log(rf.me, "New log record needed to send to peer-"+strconv.Itoa(i)+".")
+					}
+				}
 			}
 		}
 		Log(rf.me, "Stop to fulfill leader duty to peer-"+strconv.Itoa(i)+".")
 	}
 }
 
-func (rf *Raft) sendAppendEntryWithTimeout(i int, args *AppendEntriesArgs, lastLogIndex int, ch chan bool) {
+func (rf *Raft) sendAppendEntryWithTimeout(i int, args *AppendEntriesArgs, lastLogIndex int, immeCh chan bool, doneCh chan bool) {
 	Log(rf.me, "Sending AppendEntry request to peer-"+strconv.Itoa(i)+".")
-	reply := &AppendEntriesReply{}
-	requestFinishedCh := make(chan bool)
 
-	go rf.sendAppendEntries(i, args, reply, requestFinishedCh)
-	var ok bool
-	select {
-	case <-time.After(time.Duration(heartbeatTimeout()) * time.Millisecond):
-		Log(rf.me, "AppendEntry request to peer-"+strconv.Itoa(i)+" TIMEOUT.")
-		return
-	case ok = <-requestFinishedCh:
+	exitBehavior := func(res bool) {
+		select {
+		case immeCh <- res:
+		case <-doneCh:
+		}
 	}
+
+	reply := &AppendEntriesReply{}
+
+	ok := rf.sendAppendEntries(i, args, reply)
 	if !ok {
+		exitBehavior(false)
 		return
 	}
 
 	res := rf.checkReceivedTerm(reply.Term)
 	if res > 0 {
+		exitBehavior(false)
 		return
 	}
+
 	if !reply.Success {
 		rf.mu.Lock()
 		if reply.ConflictTerm < 0 {
@@ -737,16 +743,21 @@ func (rf *Raft) sendAppendEntryWithTimeout(i int, args *AppendEntriesArgs, lastL
 		}
 		Log(rf.me, "Set rf.nextIndex for "+strconv.Itoa(i)+" = "+strconv.Itoa(rf.nextIndex[i])+".")
 		rf.mu.Unlock()
-		ch <- false
-		return
-	}
-	rf.logReplicated(i, args.PrevLogIndex+len(args.Entries))
-	rf.mu.Lock()
-	rf.nextIndex[i] += len(args.Entries)
-	nextIndexFori := rf.nextIndex[i]
-	rf.mu.Unlock()
-	if nextIndexFori <= lastLogIndex {
-		ch <- true
+		// notify leaderduty goroutine to send more AE immediately
+		exitBehavior(true)
+	} else {
+		rf.logReplicated(i, args.PrevLogIndex+len(args.Entries))
+		rf.mu.Lock()
+		rf.nextIndex[i] += len(args.Entries)
+		Log(rf.me, "Set rf.nextIndex for "+strconv.Itoa(i)+" = "+strconv.Itoa(rf.nextIndex[i])+".")
+		nextIndexFori := rf.nextIndex[i]
+		rf.mu.Unlock()
+		if nextIndexFori <= lastLogIndex {
+			// notify leaderduty goroutine to send more AE immediately
+			exitBehavior(true)
+		} else {
+			exitBehavior(false)
+		}
 	}
 }
 
