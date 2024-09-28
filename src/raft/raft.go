@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -82,10 +84,10 @@ type LogEntry struct {
 
 const (
 	// unit: ms
-	heartbeatPeriod               int64 = 120
+	heartbeatPeriod               int64 = 200
 	electionTimeoutBase           int64 = 800
 	electionTimeoutVariationRange int64 = 400
-	delayTolerance                      = 20
+	delayTolerance                      = 10
 )
 
 func heartbeatTimeout() int64 {
@@ -254,7 +256,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// at least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastLogIndex := len(rf.log) - 1
-		if lastLogIndex <= 0 {
+		if lastLogIndex < 0 {
 			reply.Granted = true
 		} else if rf.log[lastLogIndex].Term < args.LastLogTerm {
 			reply.Granted = true
@@ -320,8 +322,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 func (rf *Raft) initAppendEntriesArgs(i int) *AppendEntriesArgs {
@@ -350,14 +354,10 @@ func (rf *Raft) initAppendEntriesArgs(i int) *AppendEntriesArgs {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if rf.me == args.LeaderId {
-		log.Panic("Leader won't send AppendEntry to itself.")
-	}
-	if args.PrevLogIndex < -1 {
-		log.Panic("PrevLogIndex field in AppendEntriesArgs is at least -1.")
-	}
+	assert(rf.me != args.LeaderId, "Leader won't send AppendEntry to itself.")
+	assert(args.PrevLogIndex >= -1, "PrevLogIndex field in AppendEntriesArgs is at least -1.")
 
-	Log(rf.me, "Receive AppendEntry request from "+strconv.Itoa(args.LeaderId)+" with term = "+strconv.Itoa(args.Term)+", prev log index = "+strconv.Itoa(args.PrevLogIndex)+".")
+	Log(rf.me, "Receive AppendEntry request from "+strconv.Itoa(args.LeaderId)+" with term = "+strconv.Itoa(args.Term)+", prev log index = "+strconv.Itoa(args.PrevLogIndex)+", num of entries = "+strconv.Itoa(len(args.Entries))+".")
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
@@ -369,9 +369,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.state == leaderState {
-		log.Fatal("Leader received an AppendEntry request with same term from other server.")
-	}
+	assert(rf.state != leaderState, "Leader will never receive an AppendEntry request with SAME term from other server.")
 	// If AppendEntries RPC received from new leader: convert to follower
 	if rf.state == candidateState {
 		rf.state = followerState
@@ -380,10 +378,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// whose term matches prevLogTerm (§5.3)
 	if len(rf.log)-1 < args.PrevLogIndex {
 		Log(rf.me, "Current log doesn’t contain an entry at prevLogIndex.")
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = len(rf.log) - 1
+		Log(rf.me, fmt.Sprintf("Set ConflictTerm = %v, ConflictIndex = %v.", reply.ConflictTerm, reply.ConflictIndex))
 		return
 	}
 	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		Log(rf.me, "Current log entry' term in prevLogIndex doesn't matches prevLogTerm.")
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		index := args.PrevLogIndex
+		for index > 0 {
+			if rf.log[index-1].Term != reply.ConflictTerm {
+				break
+			}
+			index--
+		}
+		reply.ConflictIndex = index
+		Log(rf.me, fmt.Sprintf("Set ConflictTerm = %v, ConflictIndex = %v.", reply.ConflictTerm, reply.ConflictIndex))
 		return
 	}
 	// If an existing entry conflicts with a new one (same index
@@ -409,6 +420,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.persist()
 	rf.timer = electionTimeout()
 	reply.Success = true
+	Log(rf.me, "AppendEntry request return succseefully.")
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply, ch chan bool) {
@@ -710,7 +722,20 @@ func (rf *Raft) sendAppendEntryWithTimeout(i int, args *AppendEntriesArgs, lastL
 	}
 	if !reply.Success {
 		rf.mu.Lock()
-		rf.nextIndex[i] -= 1
+		if reply.ConflictTerm < 0 {
+			rf.nextIndex[i] = reply.ConflictIndex + 1
+		} else {
+			assert(reply.ConflictIndex >= 0, "Conflict index should not less than 0.")
+			idx := args.PrevLogIndex - 1
+			for idx >= reply.ConflictIndex {
+				if rf.log[idx].Term == reply.ConflictTerm {
+					break
+				}
+				idx--
+			}
+			rf.nextIndex[i] = idx + 1
+		}
+		Log(rf.me, "Set rf.nextIndex for "+strconv.Itoa(i)+" = "+strconv.Itoa(rf.nextIndex[i])+".")
 		rf.mu.Unlock()
 		ch <- false
 		return
@@ -742,7 +767,7 @@ func (rf *Raft) logReplicated(serverId int, logIndex int) {
 	matches = append(matches, rf.matchIndex...)
 	sort.Ints(matches)
 	majorityReplicatedIndex := matches[len(matches)/2]
-	if majorityReplicatedIndex >= 0 && rf.log[majorityReplicatedIndex].Term < rf.currentTerm {
+	if majorityReplicatedIndex < 0 || rf.log[majorityReplicatedIndex].Term < rf.currentTerm {
 		return
 	}
 	committedLogIndex := majorityReplicatedIndex
@@ -782,6 +807,18 @@ func (rf *Raft) applyCommittedLog() {
 		rf.mu.Lock()
 		Log(rf.me, fmt.Sprintf("Applying committed log from index %v to %v, applied log: %v", lastApplied+1, commitIndex, rf.logRangeOverview(0, commitIndex+1)))
 		rf.mu.Unlock()
+	}
+}
+
+func assert(state bool, msg string) {
+	if !state {
+		pc, file, no, ok := runtime.Caller(1)
+		details := runtime.FuncForPC(pc)
+		if ok {
+			log.Fatal("Assert failed [" + filepath.Base(file) + ":" + strconv.Itoa(no) + " " + details.Name() + "]: " + msg)
+		} else {
+			log.Fatal("Assert failed: " + msg)
+		}
 	}
 }
 
