@@ -972,6 +972,8 @@ func TestFigure8Unreliable3C(t *testing.T) {
 		}
 	}
 
+	log.Println("Reconnect all peers, preparing for consistency check!")
+
 	for i := 0; i < servers; i++ {
 		if cfg.connected[i] == false {
 			cfg.connect(i)
