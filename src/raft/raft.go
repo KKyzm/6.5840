@@ -273,7 +273,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.Granted = false
 
-	newTermAtFollower := false
 	// don't use the checkReceivedTerm method directly, because I don't want the timer to be reset when receiving newer term with less up-to-date log
 	if rf.currentTerm > args.Term {
 		// deny any requests that term < currentTerm
@@ -285,8 +284,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.Log("Received vote request with higher term. Become Follower!")
 			rf.state = followerState
 			rf.timer = electionTimeout()
-		} else {
-			newTermAtFollower = true
 		}
 		rf.persist()
 	}
@@ -308,9 +305,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if reply.Granted {
 		rf.Log("Grant vote to " + strconv.Itoa(args.CandidateId) + ".")
 		rf.votedFor = args.CandidateId
-		if newTermAtFollower {
-			rf.timer = electionTimeout()
-		}
+		rf.timer = electionTimeout()
 	} else {
 		rf.Log("Refuse to grant vote to " + strconv.Itoa(args.CandidateId) + ".")
 	}
@@ -491,9 +486,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.persist()
 	rf.highestIdxFromLeader = max(rf.highestIdxFromLeader, args.PrevLogIndex+len(args.Entries))
 
-	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of LAST NEW ENTRY)
 	if rf.commitIndex < args.LeaderCommit {
-		rf.commitIndex = min(args.LeaderCommit, rf.logLength()-1)
+		rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
 		go func() {
 			rf.applyNotifyCh <- 0
 		}()
