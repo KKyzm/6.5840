@@ -1203,6 +1203,15 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 	cfg.end()
 }
 
+func TestLogFileConfig3D(t *testing.T) {
+	f, err := os.OpenFile("3D.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	log.SetOutput(f)
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+}
+
 func TestSnapshotBasic3D(t *testing.T) {
 	snapcommon(t, "Test (3D): snapshots basic", false, true, false)
 }
