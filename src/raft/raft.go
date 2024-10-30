@@ -370,8 +370,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
-	// ths following two fields matter when follower's log isn't consistent with leader's log at AppendEntriesArgs's PrevLogIndex
-	ConflictTerm  int // -1 if follower do not have a log at PrevLogIndex, otherwise the term of that log
+	// ths following field matter when follower's log isn't consistent with leader's log at AppendEntriesArgs's PrevLogIndex
 	ConflictIndex int // index of follower's last log if follower do not have a log at PrevLogIndex, otherwise index of last log whose term do not equal to ConflictTerm
 	// follower can use ConflictIndex as this follower's new PrevLogIndex
 }
@@ -431,8 +430,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = false
 	res := rf.checkReceivedTerm(args.Term)
 	if res < 0 {
-		// deny any requests that term < currentTerm
-		return
+		return // deny any requests that term < currentTerm
 	}
 
 	assert(rf.state != leaderState, "Leader will never receive an AppendEntry request with SAME term from other peer.")
@@ -457,36 +455,35 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
 	if args.PrevLogIndex >= rf.logLength() {
-		rf.Log("Current log doesn’t contain an entry at prevLogIndex.")
-		reply.ConflictTerm = -1
+		rf.Log("Current prev log doesn’t contain an entry at prevLogIndex.")
 		reply.ConflictIndex = rf.logLength() - 1
-		rf.Log(fmt.Sprintf("Set ConflictTerm = %v, ConflictIndex = %v.", reply.ConflictTerm, reply.ConflictIndex))
+		rf.Log(fmt.Sprintf("Set ConflictIndex = %v.", reply.ConflictIndex))
 		return
 	}
 	if args.PrevLogIndex >= 0 && rf.getLogTerm(args.PrevLogIndex) != args.PrevLogTerm {
-		rf.Log("Current log entry' term in prevLogIndex doesn't matches prevLogTerm.")
-		reply.ConflictTerm = rf.getLogTerm(args.PrevLogIndex)
+		rf.Log("Current prev log's term in prevLogIndex doesn't matches prevLogTerm.")
 		index := args.PrevLogIndex
 		for index >= 0 {
-			if rf.getLogTerm(index) != reply.ConflictTerm {
+			if rf.getLogTerm(index) != rf.getLogTerm(args.PrevLogIndex) {
 				break
 			}
 			index--
 		}
 		reply.ConflictIndex = index
-		rf.Log(fmt.Sprintf("Set ConflictTerm = %v, ConflictIndex = %v.", reply.ConflictTerm, reply.ConflictIndex))
+		rf.Log(fmt.Sprintf("Set ConflictIndex = %v.", reply.ConflictIndex))
 		return
 	}
-	// If an existing entry conflicts with a new one (same index
+
+	// IF an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
-	trunc := max(args.PrevLogIndex+1, rf.highestIdxFromLeader+1)
-	rf.log = rf.log[:trunc-rf.snapshotLastLogIndex-1]
-
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
 		if idx < rf.logLength() {
-			rf.setLogEntry(idx, entry)
+			if entry.Term != rf.getLogEntry(idx).Term {
+				rf.log = rf.log[:idx-rf.snapshotLastLogIndex-1]
+				rf.log = append(rf.log, entry)
+			}
 		} else {
 			rf.log = append(rf.log, entry)
 		}
@@ -879,7 +876,6 @@ func (rf *Raft) sendAppendEntries(i int, args *AppendEntriesArgs, immeCh chan bo
 
 	ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
 	if !ok {
-		// exitBehavior(false)
 		return
 	}
 
