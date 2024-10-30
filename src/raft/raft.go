@@ -84,8 +84,8 @@ type LogEntry struct {
 
 const (
 	// unit: ms
-	heartbeatPeriod               int64 = 120
-	electionTimeoutBase           int64 = 800
+	heartbeatPeriod               int64 = 100
+	electionTimeoutBase           int64 = 600
 	electionTimeoutVariationRange int64 = 400
 )
 
