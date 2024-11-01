@@ -52,7 +52,6 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 
-	// For 3D:
 	SnapshotValid bool
 	Snapshot      []byte
 	SnapshotTerm  int
@@ -107,13 +106,12 @@ type Raft struct {
 	me              int        // this peer's index into peers[]
 	dead            int32      // set by Kill()
 
-	// Your data here (3A, 3B, 3C).
 	timer         int64
 	leaderId      int
 	applyCh       chan ApplyMsg
 	applyNotifyCh chan int
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+
+	// paper's Figure 2
 
 	// persistent state on all servers
 	state                serverState
@@ -124,9 +122,8 @@ type Raft struct {
 	snapshotLastLogIndex int
 	snapshotLastLogTerm  int
 	// volatile state on all servers
-	commitIndex          int // index of highest log entry known to be committed (initialized to 0, increases monotonically)
-	lastApplied          int // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
-	highestIdxFromLeader int
+	commitIndex int // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+	lastApplied int // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
 	// volatile state on leaders (reinitialized after election)
 	nextIndex       []int // index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchIndex      []int // index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
@@ -142,7 +139,6 @@ const (
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	// Your code here (3A).
 	lockStartTime := rf.lockTime()
 	defer rf.unlockTime(lockStartTime)
 	return rf.currentTerm, rf.state == leaderState
@@ -156,7 +152,6 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (3C).
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
@@ -174,7 +169,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
 	labgob.Register(LogEntry{})
 
 	r := bytes.NewBuffer(data)
@@ -208,7 +202,6 @@ func (rf *Raft) readPersist(data []byte) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
 	lockStartTime := rf.lockTime()
 	defer rf.unlockTime(lockStartTime)
 
@@ -233,7 +226,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 type RequestVoteArgs struct {
-	// Your data here (3A, 3B).
 	Term         int
 	CandidateId  int
 	LastLogIndex int
@@ -241,7 +233,6 @@ type RequestVoteArgs struct {
 }
 
 type RequestVoteReply struct {
-	// Your data here (3A).
 	Term    int
 	Granted bool
 }
@@ -263,9 +254,7 @@ func (rf *Raft) initRequestVoteArgs() *RequestVoteArgs {
 
 // RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
 	rf.Log("Receive vote request from " + strconv.Itoa(args.CandidateId) + ".")
-	// res := rf.checkReceivedTerm(args.Term)
 
 	lockStartTime := rf.lockTime()
 	defer rf.unlockTime(lockStartTime)
@@ -365,9 +354,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
-	// ths following field matter when follower's log isn't consistent with leader's log at AppendEntriesArgs's PrevLogIndex
-	ConflictIndex int // index of follower's last log if follower do not have a log at PrevLogIndex, otherwise index of last log whose term do not equal to ConflictTerm
+	// ths ConflictIndex field matter when follower's log isn't consistent with leader's log at AppendEntriesArgs's PrevLogIndex
 	// follower can use ConflictIndex as this follower's new PrevLogIndex
+	ConflictIndex int // index of follower's last log if follower do not have a log at PrevLogIndex, otherwise index of last log whose term do not equal to ConflictTerm
 }
 
 func (args *AppendEntriesArgs) str() string {
@@ -375,8 +364,6 @@ func (args *AppendEntriesArgs) str() string {
 }
 
 func (rf *Raft) initAppendEntriesArgs(i int) *AppendEntriesArgs {
-	// rf.Log("@@@ Enter initAppendEntriesArgs @@@")
-	// defer rf.Log("@@@ Leave initAppendEntriesArgs @@@")
 	lockStartTime := rf.lockTime()
 	defer rf.unlockTime(lockStartTime)
 
@@ -433,9 +420,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.state == candidateState {
 		rf.state = followerState
 	}
-	if args.LeaderId != rf.leaderId {
-		rf.highestIdxFromLeader = -1
-	}
 
 	// update server state
 	defer func() {
@@ -484,7 +468,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	rf.persist()
-	rf.highestIdxFromLeader = max(rf.highestIdxFromLeader, args.PrevLogIndex+len(args.Entries))
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of LAST NEW ENTRY)
 	if rf.commitIndex < args.LeaderCommit {
@@ -577,7 +560,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	// Your code here (3B).
 	// state check
 	if rf.killed() {
 		return -1, -1, false
@@ -650,7 +632,6 @@ func (rf *Raft) killed() bool {
 // Tick until election timeout.
 func (rf *Raft) electionTicker() {
 	for !rf.killed() {
-		// Your code here (3A)
 		lockStartTime := rf.lockTime()
 		if rf.timer == 0 {
 			rf.Log("Timeout! current state: " + rf.state.str())
@@ -676,7 +657,6 @@ func (rf *Raft) electionTicker() {
 			ms = min(20, rf.timer)
 			rf.timer -= ms
 		}
-		// rf.Log("Tick for "+strconv.Itoa(int(ms))+"ms, rf.timer remains "+strconv.Itoa(int(rf.timer))+"ms.")
 		rf.unlockTime(lockStartTime)
 
 		time.Sleep(time.Duration(ms) * time.Millisecond)
@@ -740,8 +720,6 @@ func (rf *Raft) startElection(electionTerm int) {
 	voteCount := 1
 	for range rf.peers {
 		reply := <-voteReplyCh
-
-		// rf.checkReceivedTerm(reply.Term)
 
 		lockStartTime := rf.lockTime()
 		if rf.currentTerm != electionTerm || rf.state != candidateState {
@@ -1033,8 +1011,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (3A, 3B, 3C).
-
 	rf.dead = 0
 	rf.timer = electionTimeout()
 	rf.leaderId = -1
@@ -1049,7 +1025,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.commitIndex = -1
 	rf.lastApplied = -1
-	rf.highestIdxFromLeader = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
