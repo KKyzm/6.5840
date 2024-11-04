@@ -439,18 +439,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.Log(fmt.Sprintf("Set ConflictIndex = %v.", reply.ConflictIndex))
 		return
 	}
-	if args.PrevLogIndex >= 0 && rf.getLogTerm(args.PrevLogIndex) != args.PrevLogTerm {
-		rf.Log("Current prev log's term in prevLogIndex doesn't matches prevLogTerm.")
-		index := args.PrevLogIndex
-		for index >= 0 {
-			if rf.getLogTerm(index) != rf.getLogTerm(args.PrevLogIndex) {
-				break
-			}
-			index--
+	if args.PrevLogIndex >= 0 {
+		if args.PrevLogIndex < rf.snapshotLastLogIndex {
+			rf.Log("Current prev log has been merged in snapshot.")
+			reply.ConflictIndex = args.PrevLogIndex
+			rf.Log(fmt.Sprintf("Set ConflictIndex = %v.", reply.ConflictIndex))
+			return
 		}
-		reply.ConflictIndex = index
-		rf.Log(fmt.Sprintf("Set ConflictIndex = %v.", reply.ConflictIndex))
-		return
+		if rf.getLogTerm(args.PrevLogIndex) != args.PrevLogTerm {
+			rf.Log("Current prev log's term in prevLogIndex doesn't matches prevLogTerm.")
+			index := args.PrevLogIndex
+			for index >= 0 {
+				if rf.getLogTerm(index) != rf.getLogTerm(args.PrevLogIndex) {
+					break
+				}
+				index--
+			}
+			reply.ConflictIndex = index
+			rf.Log(fmt.Sprintf("Set ConflictIndex = %v.", reply.ConflictIndex))
+			return
+		}
 	}
 
 	// IF an existing entry conflicts with a new one (same index
@@ -869,7 +877,8 @@ func (rf *Raft) sendAppendEntries(i int, args *AppendEntriesArgs, immeCh chan bo
 	}
 
 	if !reply.Success {
-		rf.nextIndex[i] = min(rf.nextIndex[i], reply.ConflictIndex+1)
+		// rf.nextIndex[i] = min(rf.nextIndex[i], reply.ConflictIndex+1)
+		rf.nextIndex[i] = reply.ConflictIndex + 1
 		rf.Log("Set rf.nextIndex for peer-" + strconv.Itoa(i) + " = " + strconv.Itoa(rf.nextIndex[i]) + ".")
 		exitBehavior(true)
 	} else {
