@@ -1,28 +1,25 @@
 package kvraft
 
 import (
+	"fmt"
+	"log"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
-	"log"
-	"sync"
-	"sync/atomic"
 )
 
-const Debug = false
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
-
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Type  string
+	Key   string
+	Value string
+
+	ClientId int
+	Seq      int
 }
 
 type KVServer struct {
@@ -35,19 +32,182 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	idMoCh  chan int
+	kvstore map[string]string
+	replied map[int]replyCache
+	pending map[int]pendingInfo
 }
 
+type replyCache struct {
+	result string
+	seq    int
+}
 
+type pendingInfo struct {
+	ch       chan bool
+	clientId int
+	seq      int
+}
+
+// Get RPC handler
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	_, isleader := kv.rf.GetState()
+	if !isleader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.log(fmt.Sprintf("Get request received, ClientId = %v, Seq = %v, Key = %v.", args.ClientId, args.Seq, args.Key))
+	if args.Seq <= kv.replied[args.ClientId].seq {
+		reply.Err = OK
+		reply.Value = kv.replied[args.ClientId].result
+		kv.log("Request has already been replied, return.")
+		return
+	}
+
+	index, _, _ := kv.rf.Start(Op{"Get", args.Key, "", args.ClientId, args.Seq})
+	kv.log("Launch a log, index = " + strconv.Itoa(index) + ", waiting...")
+	ch := make(chan bool)
+	kv.pending[index] = pendingInfo{ch, args.ClientId, args.Seq}
+	kv.notifyMo()
+
+	kv.mu.Unlock()
+	ok := <-ch
+	kv.mu.Lock()
+
+	if !ok {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	kv.log("Launched log applied!")
+	value, ok := kv.kvstore[args.Key]
+	if ok {
+		reply.Value = value
+		reply.Err = OK
+		kv.log("Get handler return successfully with value = " + reply.Value + ".")
+	} else {
+		reply.Err = ErrNoKey
+		kv.log("Get handler return with ErrNoKey.")
+	}
+}
+
+// Put/Append RPC handler
+func (kv *KVServer) putAppend(op string, args *PutAppendArgs, reply *PutAppendReply) {
+	kv.mu.Lock()
+	unlocked := false
+	defer func() {
+		if !unlocked {
+			kv.mu.Unlock()
+		}
+	}()
+
+	_, isleader := kv.rf.GetState()
+	if !isleader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.log(fmt.Sprintf("%v request received, ClientId = %v, Seq = %v, Key = %v, Value = %v.", op, args.ClientId, args.Seq, args.Key, args.Value))
+	if args.Seq == kv.replied[args.ClientId].seq {
+		reply.Err = OK
+		kv.log("Request has already been replied.")
+		return
+	}
+
+	index, _, _ := kv.rf.Start(Op{op, args.Key, args.Value, args.ClientId, args.Seq})
+	kv.log("Launch a log, index = " + strconv.Itoa(index) + ", waiting...")
+	ch := make(chan bool)
+	kv.pending[index] = pendingInfo{ch, args.ClientId, args.Seq}
+	kv.notifyMo()
+
+	unlocked = true
+	kv.mu.Unlock()
+
+	ok := <-ch
+	if !ok {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	kv.log("Launched log applied!")
+	reply.Err = OK
+	kv.log(op + " handler return.")
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	kv.putAppend("Put", args, reply)
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	kv.putAppend("Append", args, reply)
+}
+
+func (kv *KVServer) applier() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+		kv.log("ApplyMsg received from applyCh.")
+		if msg.CommandValid {
+			// apply log to kvstore
+			kv.mu.Lock()
+			op := msg.Command.(Op)
+			kv.log(fmt.Sprintf("Applied msg is command, log index = %v, clientId = %v, Seq = %v, Op = %v, Key = %v, Value = %v.", msg.CommandIndex, op.ClientId, op.Seq, op.Type, op.Key, op.Value))
+			cache := replyCache{}
+			cache.seq = op.Seq
+			if kv.replied[op.ClientId].seq < op.Seq {
+				switch op.Type {
+				case "Get":
+					value, ok := kv.kvstore[op.Key]
+					if ok {
+						cache.result = value
+						kv.replied[op.ClientId] = cache
+					}
+				case "Put":
+					kv.replied[op.ClientId] = cache
+					kv.kvstore[op.Key] = op.Value
+				case "Append":
+					kv.replied[op.ClientId] = cache
+					kv.kvstore[op.Key] += op.Value
+				}
+			}
+
+			info, ok := kv.pending[msg.CommandIndex]
+			if ok {
+				res := info.clientId == op.ClientId && info.seq == op.Seq
+				info.ch <- res
+				delete(kv.pending, msg.CommandIndex)
+			}
+			kv.mu.Unlock()
+		}
+	}
+}
+
+func (kv *KVServer) identityMonitor() {
+	for !kv.killed() {
+		<-kv.idMoCh
+		for {
+			_, isleader := kv.rf.GetState()
+			if !isleader {
+				kv.log("Lose Leadership... notify all pending handler.")
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		kv.mu.Lock()
+		for _, info := range kv.pending {
+			info.ch <- false
+		}
+		kv.pending = make(map[int]pendingInfo)
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) notifyMo() {
+	select {
+	case kv.idMoCh <- 0:
+	default:
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -89,13 +249,20 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
-	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.idMoCh = make(chan int)
+	kv.kvstore = make(map[string]string)
+	kv.replied = make(map[int]replyCache)
+	kv.pending = make(map[int]pendingInfo)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	// launch background goroutine to keep reading applyCh and apply it on kvstore
+	go kv.identityMonitor()
+	go kv.applier()
 
 	return kv
+}
+
+func (kv *KVServer) log(message string) {
+	log.Printf("Server #%v : %v", kv.me, message)
 }
