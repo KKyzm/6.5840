@@ -605,6 +605,15 @@ func TestPersistPartitionUnreliableLinearizable4A(t *testing.T) {
 	GenericTest(t, "4A", 15, 7, true, true, true, -1, true)
 }
 
+func TestLogFileConfig4B(t *testing.T) {
+	f, err := os.OpenFile("4B.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	log.SetOutput(f)
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+}
+
 // if one server falls behind, then rejoins, does it
 // recover by using the InstallSnapshot RPC?
 // also checks that majority discards committed log entries

@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"strconv"
@@ -32,15 +33,18 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	idMoCh  chan int
-	kvstore map[string]string
-	replied map[int]replyCache
-	pending map[int]pendingInfo
+	idMoCh           chan int
+	formSsCh         chan int
+	persister        *raft.Persister
+	kvstore          map[string]string
+	replied          map[int]replyCache
+	pending          map[int]pendingInfo
+	lastAppliedIndex int
 }
 
 type replyCache struct {
-	result string
-	seq    int
+	Result string
+	Seq    int
 }
 
 type pendingInfo struct {
@@ -61,9 +65,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	kv.log(fmt.Sprintf("Get request received, ClientId = %v, Seq = %v, Key = %v.", args.ClientId, args.Seq, args.Key))
-	if args.Seq <= kv.replied[args.ClientId].seq {
+	if args.Seq <= kv.replied[args.ClientId].Seq {
 		reply.Err = OK
-		reply.Value = kv.replied[args.ClientId].result
+		reply.Value = kv.replied[args.ClientId].Result
 		kv.log("Request has already been replied, return.")
 		return
 	}
@@ -75,6 +79,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.notifyMo()
 
 	kv.mu.Unlock()
+
+	// notice formSnapshot goroutine if it's pending
+	select {
+	case kv.formSsCh <- 0:
+	default:
+	}
+
 	ok := <-ch
 	kv.mu.Lock()
 
@@ -111,7 +122,7 @@ func (kv *KVServer) putAppend(op string, args *PutAppendArgs, reply *PutAppendRe
 	}
 
 	kv.log(fmt.Sprintf("%v request received, ClientId = %v, Seq = %v, Key = %v, Value = %v.", op, args.ClientId, args.Seq, args.Key, args.Value))
-	if args.Seq == kv.replied[args.ClientId].seq {
+	if args.Seq == kv.replied[args.ClientId].Seq {
 		reply.Err = OK
 		kv.log("Request has already been replied.")
 		return
@@ -125,6 +136,12 @@ func (kv *KVServer) putAppend(op string, args *PutAppendArgs, reply *PutAppendRe
 
 	unlocked = true
 	kv.mu.Unlock()
+
+	// notice formSnapshot goroutine if it's pending
+	select {
+	case kv.formSsCh <- 0:
+	default:
+	}
 
 	ok := <-ch
 	if !ok {
@@ -144,6 +161,36 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.putAppend("Append", args, reply)
 }
 
+func (kv *KVServer) formSnapshot() {
+	for !kv.killed() {
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-kv.formSsCh:
+		}
+
+		if kv.maxraftstate < 0 {
+			continue
+		}
+
+		kv.mu.Lock()
+		kv.log(fmt.Sprintf("Current RaftStateSize = %v.", kv.persister.RaftStateSize()))
+		if float64(kv.persister.RaftStateSize()) < 0.8*float64(kv.maxraftstate) {
+			kv.mu.Unlock()
+			continue
+		}
+
+		kv.log("RaftStateSize too large, forming snapshot.")
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+		e.Encode(kv.lastAppliedIndex)
+		e.Encode(kv.kvstore)
+		e.Encode(kv.replied)
+		kv.rf.Snapshot(kv.lastAppliedIndex, w.Bytes())
+		kv.log(fmt.Sprintf("After forming snapshot: lastAppliedIndex = %v, RaftStateSize = %v.", kv.lastAppliedIndex, kv.persister.RaftStateSize()))
+		kv.mu.Unlock()
+	}
+}
+
 func (kv *KVServer) applier() {
 	for !kv.killed() {
 		msg := <-kv.applyCh
@@ -154,13 +201,13 @@ func (kv *KVServer) applier() {
 			op := msg.Command.(Op)
 			kv.log(fmt.Sprintf("Applied msg is command, log index = %v, clientId = %v, Seq = %v, Op = %v, Key = %v, Value = %v.", msg.CommandIndex, op.ClientId, op.Seq, op.Type, op.Key, op.Value))
 			cache := replyCache{}
-			cache.seq = op.Seq
-			if kv.replied[op.ClientId].seq < op.Seq {
+			cache.Seq = op.Seq
+			if kv.replied[op.ClientId].Seq < op.Seq {
 				switch op.Type {
 				case "Get":
 					value, ok := kv.kvstore[op.Key]
 					if ok {
-						cache.result = value
+						cache.Result = value
 						kv.replied[op.ClientId] = cache
 					}
 				case "Put":
@@ -172,11 +219,33 @@ func (kv *KVServer) applier() {
 				}
 			}
 
+			kv.lastAppliedIndex = max(kv.lastAppliedIndex, msg.CommandIndex)
 			info, ok := kv.pending[msg.CommandIndex]
 			if ok {
 				res := info.clientId == op.ClientId && info.seq == op.Seq
 				info.ch <- res
 				delete(kv.pending, msg.CommandIndex)
+			}
+			kv.mu.Unlock()
+
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			kv.log(fmt.Sprintf("Applied msg is snapshot, snapshotLastIndex = %v, snapshotLastTerm = %v.", msg.CommandIndex, msg.SnapshotTerm))
+			if msg.SnapshotIndex > kv.lastAppliedIndex {
+				kv.log(fmt.Sprintf("Current lastAppliedIndex = %v, so apply this snapshot", kv.lastAppliedIndex))
+				kv.lastAppliedIndex = msg.SnapshotIndex
+				r := bytes.NewBuffer(msg.Snapshot)
+				d := labgob.NewDecoder(r)
+				lastAppliedIndex := 0
+				kvstore := make(map[string]string)
+				replied := make(map[int]replyCache)
+				if d.Decode(&lastAppliedIndex) != nil || d.Decode(&kvstore) != nil || d.Decode(&replied) != nil {
+					log.Fatal("Failed to decode snapshot...")
+				} else {
+					kv.lastAppliedIndex = lastAppliedIndex
+					kv.kvstore = kvstore
+					kv.replied = replied
+				}
 			}
 			kv.mu.Unlock()
 		}
@@ -192,7 +261,7 @@ func (kv *KVServer) identityMonitor() {
 				kv.log("Lose Leadership... notify all pending handler.")
 				break
 			}
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 		}
 		kv.mu.Lock()
 		for _, info := range kv.pending {
@@ -251,14 +320,37 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.idMoCh = make(chan int)
+	kv.formSsCh = make(chan int)
+	kv.persister = persister
 	kv.kvstore = make(map[string]string)
 	kv.replied = make(map[int]replyCache)
 	kv.pending = make(map[int]pendingInfo)
+	kv.lastAppliedIndex = 0
+
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		kv.mu.Lock()
+		r := bytes.NewBuffer(snapshot)
+		d := labgob.NewDecoder(r)
+		lastAppliedIndex := 0
+		kvstore := make(map[string]string)
+		replied := make(map[int]replyCache)
+		if d.Decode(&lastAppliedIndex) != nil || d.Decode(&kvstore) != nil || d.Decode(&replied) != nil {
+			log.Fatal("Failed to decode snapshot...")
+		} else {
+			kv.lastAppliedIndex = lastAppliedIndex
+			kv.kvstore = kvstore
+			kv.replied = replied
+		}
+		kv.mu.Unlock()
+	}
+
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// launch background goroutine to keep reading applyCh and apply it on kvstore
 	go kv.identityMonitor()
 	go kv.applier()
+	go kv.formSnapshot()
 
 	return kv
 }
