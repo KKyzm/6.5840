@@ -450,7 +450,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.Log("Current prev log's term in prevLogIndex doesn't matches prevLogTerm.")
 			index := args.PrevLogIndex
 			for index >= 0 {
-				if rf.getLogTerm(index) != rf.getLogTerm(args.PrevLogIndex) {
+				assert(index >= rf.snapshotLastLogIndex, "Index should always bigger or equal to rf.snapshotLastLogIndex.")
+				if index == rf.snapshotLastLogIndex || rf.getLogTerm(index) != rf.getLogTerm(args.PrevLogIndex) {
 					break
 				}
 				index--
