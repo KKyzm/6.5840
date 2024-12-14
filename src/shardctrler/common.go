@@ -34,40 +34,76 @@ const (
 
 type Err string
 
-type JoinArgs struct {
+// Common
+type RequestTag struct {
+	ClientId int
+	Seq      int
+}
+type ReplyStatus struct {
+	WrongLeader bool
+	Err         Err
+}
+
+// Join
+type RawJoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
 }
-
+type JoinArgs struct {
+	RequestTag
+	RawJoinArgs
+}
 type JoinReply struct {
-	WrongLeader bool
-	Err         Err
+	ReplyStatus
 }
 
-type LeaveArgs struct {
+// Leave
+type RawLeaveArgs struct {
 	GIDs []int
 }
-
+type LeaveArgs struct {
+	RequestTag
+	RawLeaveArgs
+}
 type LeaveReply struct {
-	WrongLeader bool
-	Err         Err
+	ReplyStatus
 }
 
-type MoveArgs struct {
+// Move
+type RawMoveArgs struct {
 	Shard int
 	GID   int
 }
-
+type MoveArgs struct {
+	RequestTag
+	RawMoveArgs
+}
 type MoveReply struct {
-	WrongLeader bool
-	Err         Err
+	ReplyStatus
 }
 
-type QueryArgs struct {
+// Query
+type RawQueryArgs struct {
 	Num int // desired config number
 }
-
+type QueryArgs struct {
+	RequestTag
+	RawQueryArgs
+}
 type QueryReply struct {
-	WrongLeader bool
-	Err         Err
-	Config      Config
+	ReplyStatus
+	Config Config
+}
+
+// Ctrler
+type CtrlerArgs struct {
+	Op string
+	RequestTag
+	RawJoinArgs
+	RawLeaveArgs
+	RawMoveArgs
+	RawQueryArgs
+}
+type CtrlerReply struct {
+	ReplyStatus
+	Config Config
 }

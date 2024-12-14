@@ -37,8 +37,8 @@ type KVServer struct {
 	formSsCh         chan int
 	persister        *raft.Persister
 	kvstore          map[string]string
-	replied          map[int]replyCache
-	pending          map[int]pendingInfo
+	replied          map[int]replyCache  // client id -> reply cache
+	pending          map[int]pendingInfo // log index -> info of pending request
 	lastAppliedIndex int
 }
 

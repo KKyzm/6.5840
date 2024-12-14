@@ -1067,7 +1067,7 @@ func assert(state bool, msg string) {
 }
 
 func (rf *Raft) Log(message string) {
-	log.Printf("Peer #%v : %v", rf.me, message)
+	// log.Printf("Peer #%v : %v", rf.me, message)
 }
 
 func (rf *Raft) lockTime() *time.Time {
