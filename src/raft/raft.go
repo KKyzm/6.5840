@@ -354,9 +354,31 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
-	// ths ConflictIndex field matter when follower's log isn't consistent with leader's log at AppendEntriesArgs's PrevLogIndex
-	// follower can use ConflictIndex as this follower's new PrevLogIndex
-	ConflictIndex int // index of follower's last log if follower do not have a log at PrevLogIndex, otherwise index of last log whose term do not equal to ConflictTerm
+
+	// IF follower do not have a log at PrevLogIndex:
+	//    SET ConflictIndex = index of follower's last log
+	//    SET ConflictTerm = -1
+	// IF log at PrevLogIndex has been merged in snapshot:
+	//    SET ConflictIndex = snapshotLastLogIndex
+	//    SET ConflictTerm = -1
+	// IF the term of log at PrevLogIndex differs with PrevLogTerm:
+	//    SET ConflictIndex = MAX of (index of last log whose term do not equal to PrevLogTerm, snapshotLastLogIndex)
+	//    SET ConflictTerm = -1 IF ConflictIndex = snapshotLastLogIndex, OTHERWISE ** actual term of log at PrevLogIndex **
+	//
+	// the ConflictIndex and ConflictTerm fields help leader to relocate PrevLogIndex quickly
+	//
+	// IF ConflictTerm = -1:
+	//    leader can use ConflictIndex directly as this follower's new PrevLogIndex
+	// ELSE:
+	//    traverse leader's logs between reply.ConflictIndex and args.PrevLogIndex reversly,
+	//    if log at idx has been merged in snapshot or it's term is reply.ConflictTerm, set PrevLogIndex = idx
+	//
+	//    since raft guarantees ** Log Matching **: if two logs contain an entry with the same index and term,
+	//    then the logs are identical in all entries up through the given index. §5.3
+	//
+	//    if none of the logs satisfies any of the conditions, just set PrevLogIndex = reply.ConflictIndex
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func (args *AppendEntriesArgs) str() string {
@@ -370,7 +392,7 @@ func (rf *Raft) initAppendEntriesArgs(i int) *AppendEntriesArgs {
 	// whether next log for peer i is included in snapshot
 	// NOTE: `check` and `get` should complete in same critical section, since rf.Snapshot may cut in line and invalidate `check`'s result
 	if rf.nextIndex[i] <= rf.snapshotLastLogIndex {
-		return nil
+		return nil // leader should send snapshot other than log entries to follower
 	}
 
 	args := AppendEntriesArgs{}
@@ -436,16 +458,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex >= rf.logLength() {
 		rf.Log("Current prev log doesn’t contain an entry at prevLogIndex.")
 		reply.ConflictIndex = rf.logLength() - 1
+		reply.ConflictTerm = -1
 		rf.Log(fmt.Sprintf("Set ConflictIndex = %v.", reply.ConflictIndex))
 		return
 	}
 	if args.PrevLogIndex >= 0 {
+		// some checks
+		// 1. whether log at PrevLogIndex has been merged in snapshot
 		if args.PrevLogIndex < rf.snapshotLastLogIndex {
 			rf.Log("Current prev log has been merged in snapshot.")
-			reply.ConflictIndex = args.PrevLogIndex
+			reply.ConflictIndex = rf.snapshotLastLogIndex
+			reply.ConflictTerm = -1
 			rf.Log(fmt.Sprintf("Set ConflictIndex = %v.", reply.ConflictIndex))
 			return
 		}
+		// 2. whether the term of log at PrevLogIndex differs with PrevLogTerm
 		if rf.getLogTerm(args.PrevLogIndex) != args.PrevLogTerm {
 			rf.Log("Current prev log's term in prevLogIndex doesn't matches prevLogTerm.")
 			index := args.PrevLogIndex
@@ -457,6 +484,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				index--
 			}
 			reply.ConflictIndex = index
+			if index == rf.snapshotLastLogIndex {
+				reply.ConflictTerm = -1
+			} else {
+				reply.ConflictTerm = rf.getLogTerm(args.PrevLogIndex)
+			}
 			rf.Log(fmt.Sprintf("Set ConflictIndex = %v.", reply.ConflictIndex))
 			return
 		}
@@ -878,14 +910,26 @@ func (rf *Raft) sendAppendEntries(i int, args *AppendEntriesArgs, immeCh chan bo
 	}
 
 	if !reply.Success {
-		// rf.nextIndex[i] = min(rf.nextIndex[i], reply.ConflictIndex+1)
-		rf.nextIndex[i] = reply.ConflictIndex + 1
-		rf.Log("Set rf.nextIndex for peer-" + strconv.Itoa(i) + " = " + strconv.Itoa(rf.nextIndex[i]) + ".")
+		if reply.ConflictTerm == -1 {
+			rf.nextIndex[i] = reply.ConflictIndex + 1
+		} else {
+			rf.nextIndex[i] = reply.ConflictIndex + 1
+			for idx := args.PrevLogIndex; idx > reply.ConflictIndex; idx-- {
+				if idx == rf.snapshotLastLogIndex || rf.getLogTerm(idx) == reply.ConflictTerm {
+					// traverse leader's logs between reply.ConflictIndex and args.PrevLogIndex reversly,
+					// if log at idx has been merged in snapshot or it's term is reply.ConflictTerm, just set nextIndex = idx + 1
+					rf.nextIndex[i] = idx + 1
+					break
+				}
+			}
+		}
+		rf.Log("AppendEntry reply's ConflictTerm = " + strconv.Itoa(reply.ConflictTerm))
+		rf.Log("Set rf.nextIndex for peer-" + strconv.Itoa(i) + " = " + strconv.Itoa(rf.nextIndex[i]))
 		exitBehavior(true)
 	} else {
 		rf.logReplicated(i, args.PrevLogIndex+len(args.Entries))
 		rf.nextIndex[i] = max(rf.nextIndex[i], args.PrevLogIndex+len(args.Entries)+1)
-		rf.Log("Set rf.nextIndex for peer-" + strconv.Itoa(i) + " = " + strconv.Itoa(rf.nextIndex[i]) + ".")
+		rf.Log("Set rf.nextIndex for peer-" + strconv.Itoa(i) + " = " + strconv.Itoa(rf.nextIndex[i]))
 		if rf.nextIndex[i] < rf.logLength() {
 			exitBehavior(true)
 		} else {
