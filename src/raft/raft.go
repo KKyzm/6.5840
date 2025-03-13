@@ -263,6 +263,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Granted = false
 
 	// don't use the checkReceivedTerm method directly, because I don't want the timer to be reset when receiving newer term with less up-to-date log
+	//
+	// Oh I remember the bug I encountered here!
+	// originally follower reset its timer when it receives vote request with newer term here,
+	// but there is a situation where the raft cluster will stagnate:
+	//  if all nodes restart (begin with follower state)
+	//  and a node who is impossible to be leader (since its log isn't newer than more than half nodes of this cluster)
+	//  then it send vote request, other nodes' timer reset their term and timer, but more than half nodes will not vote for it,
+	//  but it will not give up, the electionTicker goes on in background, and it just increment term and resend vote request,
+	//  so the raft cluster can hardly elect a leader, just repeat the loop forever.
+	//
 	if rf.currentTerm > args.Term {
 		// deny any requests that term < currentTerm
 		return
